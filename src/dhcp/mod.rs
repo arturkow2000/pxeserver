@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::iter::FromIterator;
 use std::mem::MaybeUninit;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
@@ -15,8 +14,8 @@ pub use error::{Error, Result};
 use id::ClientId;
 use packet::{
     options::{
-        DhcpOption, MessageType, DHCP_CLIENT_IDENTIFIER, DHCP_MESSAGE_TYPE, DHCP_REQUESTED_IP,
-        DHCP_SERVER_ID, DHCP_SUBNET_MASK,
+        DhcpOption, MessageType, DHCP_CLIENT_IDENTIFIER, DHCP_LEASE_TIME, DHCP_MESSAGE_TYPE,
+        DHCP_REQUESTED_IP, DHCP_SERVER_ID, DHCP_SUBNET_MASK, DHCP_TFTP_SERVER_NAME,
     },
     BootpMessageType, Packet,
 };
@@ -39,7 +38,14 @@ pub async fn start(options: &super::Options) {
 
     let broadcast_ip = Ipv4Addr::from(Into::<u32>::into(options.dhcp_subnet.address) | !mask);
 
-    debug!("{} IPs available", ip_range_size);
+    debug!("server starting");
+    debug!("server ip: {}", options.server_ip);
+    debug!("server subnet: {}", options.dhcp_subnet);
+    debug!(
+        "IP range: {} - {} ({} IP addresses available)",
+        ip_range_start, ip_range_end, ip_range_size
+    );
+    debug!("broadcast address: {}", broadcast_ip);
 
     Server {
         leases: BTreeMap::new(),
@@ -55,6 +61,7 @@ pub async fn start(options: &super::Options) {
             options.boot_file.as_path(),
             options.tftp_root.as_deref(),
         ),
+        lease_duration_secs: 3600,
     }
     .start(socket)
     .await
@@ -71,6 +78,7 @@ struct Server {
     ip_range_end: u32,
     server_ip: Ipv4Addr,
     tftp_boot_file: String,
+    lease_duration_secs: u32,
 }
 
 impl Server {
@@ -128,8 +136,14 @@ impl Server {
                         if *server_ip == self.server_ip {
                             if let Some((c, _)) = self.pending.get(requested_ip) {
                                 if *c == client_id {
-                                    self.send_ack(&socket, &client_id, packet.xid, *requested_ip)
-                                        .await;
+                                    self.send_ack(
+                                        &socket,
+                                        &client_id,
+                                        packet.xid,
+                                        *requested_ip,
+                                        packet.mac,
+                                    )
+                                    .await;
                                     self.pending.remove_entry(requested_ip);
                                     self.leases.insert(
                                         *requested_ip,
@@ -137,7 +151,9 @@ impl Server {
                                             client_id.clone(),
                                             packet.xid,
                                             Instant::now(),
-                                            Duration::from_secs(3600),
+                                            Duration::from_secs(Into::<u64>::into(
+                                                self.lease_duration_secs,
+                                            )),
                                         ),
                                     );
                                     info!(
@@ -145,10 +161,12 @@ impl Server {
                                         requested_ip, self.subnet_mask_width, client_id
                                     );
                                 } else {
-                                    self.send_nak(&socket, packet.xid, &client_id).await;
+                                    self.send_nak(&socket, packet.xid, &client_id, packet.mac)
+                                        .await;
                                 }
                             } else {
-                                self.send_nak(&socket, packet.xid, &client_id).await;
+                                self.send_nak(&socket, packet.xid, &client_id, packet.mac)
+                                    .await;
                             }
                         } else {
                             // client requests IP from another DHCP server
@@ -195,20 +213,29 @@ impl Server {
         client_id: &ClientId,
         socket: &UdpSocket,
     ) {
-        let mut ip_to_offer: Option<Ipv4Addr> = None;
+        let mut ip_to_offer: Option<Ipv4Addr>;
 
-        for (&ip, (_, _, allocation_time, lease_duration)) in self
-            .leases
-            .iter_mut()
-            .filter(|(_, (cid, _, _, _))| cid == client_id)
-        {
-            // if lease expired extend it
-            let now = Instant::now();
-            if now.duration_since(*allocation_time) > *lease_duration {
-                *allocation_time = now;
+        // if same client sends multiple discover message offer same IP as before
+        ip_to_offer = self
+            .pending
+            .iter()
+            .find(|(_, (c, _))| c == client_id)
+            .map(|(&ip, _)| ip);
+
+        if ip_to_offer.is_none() {
+            for (&ip, (_, _, allocation_time, lease_duration)) in self
+                .leases
+                .iter_mut()
+                .filter(|(_, (cid, _, _, _))| cid == client_id)
+            {
+                // if lease expired extend it
+                let now = Instant::now();
+                if now.duration_since(*allocation_time) > *lease_duration {
+                    *allocation_time = now;
+                }
+
+                ip_to_offer = Some(ip);
             }
-
-            ip_to_offer = Some(ip);
         }
 
         if ip_to_offer.is_none() {
@@ -230,6 +257,16 @@ impl Server {
             );
             options.insert(DHCP_SUBNET_MASK, DhcpOption::SubnetMask(self.subnet_mask));
             options.insert(DHCP_SERVER_ID, DhcpOption::ServerId(self.server_ip));
+            //options.insert(DHCP_ROUTER_IP, DhcpOption::RouterIp(self.server_ip));
+            options.insert(
+                DHCP_LEASE_TIME,
+                DhcpOption::LeaseTime(self.lease_duration_secs),
+            );
+            // some PXE clients need this
+            options.insert(
+                DHCP_TFTP_SERVER_NAME,
+                DhcpOption::TftpServerName(self.server_ip.to_string()),
+            );
 
             let offer_packet = Packet {
                 bootp_message_type: BootpMessageType::Reply,
@@ -243,8 +280,7 @@ impl Server {
                 yiaddr: ip_to_offer,
                 siaddr: self.server_ip,
                 giaddr: Ipv4Addr::UNSPECIFIED,
-                // TODO
-                mac: Mac::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                mac: request_packet.mac,
                 // FIXME
                 server_name: Some("dhcp-pxe-server".to_string()),
                 boot_file_name: Some(self.tftp_boot_file.clone()),
@@ -293,7 +329,7 @@ impl Server {
         }
     }
 
-    async fn send_nak(&self, socket: &UdpSocket, xid: u32, client_id: &ClientId) {
+    async fn send_nak(&self, socket: &UdpSocket, xid: u32, client_id: &ClientId, mac: Mac) {
         let mut options = BTreeMap::new();
         options.insert(DHCP_MESSAGE_TYPE, DhcpOption::MessageType(MessageType::Nak));
 
@@ -309,8 +345,7 @@ impl Server {
             yiaddr: Ipv4Addr::UNSPECIFIED,
             siaddr: self.server_ip,
             giaddr: Ipv4Addr::UNSPECIFIED,
-            // TODO
-            mac: Mac::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            mac,
             // FIXME
             server_name: Some("dhcp-pxe-server".to_string()),
             boot_file_name: Some("BOOT.COM".to_string()),
@@ -330,12 +365,21 @@ impl Server {
         client_id: &ClientId,
         xid: u32,
         ip_address: Ipv4Addr,
+        mac: Mac,
     ) {
         let mut options = BTreeMap::new();
         options.insert(DHCP_MESSAGE_TYPE, DhcpOption::MessageType(MessageType::Ack));
         options.insert(DHCP_SUBNET_MASK, DhcpOption::SubnetMask(self.subnet_mask));
         options.insert(DHCP_SERVER_ID, DhcpOption::ServerId(self.server_ip));
-        // TODO: add lease duration
+        options.insert(
+            DHCP_LEASE_TIME,
+            DhcpOption::LeaseTime(self.lease_duration_secs),
+        );
+        // some PXE clients need this
+        options.insert(
+            DHCP_TFTP_SERVER_NAME,
+            DhcpOption::TftpServerName(self.server_ip.to_string()),
+        );
 
         let packet = Packet {
             bootp_message_type: BootpMessageType::Reply,
@@ -349,8 +393,7 @@ impl Server {
             yiaddr: ip_address,
             siaddr: self.server_ip,
             giaddr: Ipv4Addr::UNSPECIFIED,
-            // TODO: should put client MAC or ours?
-            mac: Mac::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            mac,
             // TODO
             server_name: Some("dhcp-pxe-server".to_string()),
             boot_file_name: Some(self.tftp_boot_file.clone()),

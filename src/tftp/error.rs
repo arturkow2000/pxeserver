@@ -10,6 +10,9 @@ pub enum Error {
 
     #[error("unsupported mode: {0}")]
     UnsupportedMode(String),
+
+    #[error("unknown packet type {opcode}")]
+    UnknownPacketType { opcode: u16 },
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;

@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 
-use byteorder::WriteBytesExt;
+use byteorder::{NetworkEndian, WriteBytesExt};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,13 +16,16 @@ pub enum Error {
 }
 
 pub const DHCP_SUBNET_MASK: u8 = 1;
+pub const DHCP_ROUTER_IP: u8 = 3;
 pub const DHCP_REQUESTED_IP: u8 = 50;
+pub const DHCP_LEASE_TIME: u8 = 51;
 pub const DHCP_MESSAGE_TYPE: u8 = 53;
 pub const DHCP_SERVER_ID: u8 = 54;
 pub const DHCP_PARAMETER_REQUEST_LIST: u8 = 55;
 pub const DHCP_MAXIMUM_DHCP_MESSAGE_SIZE: u8 = 57;
 pub const DHCP_VENDOR_CLASS_IDENTIFIER: u8 = 60;
 pub const DHCP_CLIENT_IDENTIFIER: u8 = 61;
+pub const DHCP_TFTP_SERVER_NAME: u8 = 66;
 pub const DHCP_USER_CLASS: u8 = 77;
 pub const DHCP_CLIENT_ARCHITECTURE: u8 = 93;
 
@@ -82,10 +85,13 @@ impl Into<u8> for MessageType {
 pub enum DhcpOption {
     Unknown { tag: u8, data: Vec<u8> },
     SubnetMask(Ipv4Addr),
+    RouterIp(Ipv4Addr),
     RequestedIp(Ipv4Addr),
+    LeaseTime(u32),
     MessageType(MessageType),
     ServerId(Ipv4Addr),
     ClientIdentifier(Vec<u8>),
+    TftpServerName(String),
 }
 
 impl DhcpOption {
@@ -133,7 +139,7 @@ impl DhcpOption {
         }
     }
 
-    pub fn required_alignment(&self) -> u8 {
+    /*pub fn required_alignment(&self) -> u8 {
         match self {
             Self::SubnetMask(_) => 4,
             Self::RequestedIp(_) => 4,
@@ -142,15 +148,18 @@ impl DhcpOption {
             Self::ClientIdentifier(_) => 0,
             Self::Unknown { .. } => 0,
         }
-    }
+    }*/
 
     pub fn tag(&self) -> u8 {
         match self {
             Self::SubnetMask(_) => DHCP_SUBNET_MASK,
+            Self::RouterIp(_) => DHCP_ROUTER_IP,
             Self::RequestedIp(_) => DHCP_REQUESTED_IP,
+            Self::LeaseTime(_) => DHCP_LEASE_TIME,
             Self::MessageType(_) => DHCP_MESSAGE_TYPE,
             Self::ServerId(_) => DHCP_SERVER_ID,
             Self::ClientIdentifier(_) => DHCP_CLIENT_IDENTIFIER,
+            Self::TftpServerName(_) => DHCP_TFTP_SERVER_NAME,
             Self::Unknown { tag, .. } => *tag,
         }
     }
@@ -158,11 +167,16 @@ impl DhcpOption {
     pub fn len(&self) -> u8 {
         match self {
             Self::SubnetMask(_) => 4,
+            Self::RouterIp(_) => 4,
             Self::RequestedIp(_) => 4,
+            Self::LeaseTime(_) => 4,
             Self::MessageType(_) => 1,
             Self::ServerId(_) => 4,
             Self::ClientIdentifier(id) => {
                 TryInto::<u8>::try_into(id.len()).expect("client ID too big")
+            }
+            Self::TftpServerName(name) => {
+                TryInto::<u8>::try_into(name.len()).expect("TFTP server name too big")
             }
             Self::Unknown { tag: _, data } => {
                 TryInto::<u8>::try_into(data.len()).expect("data too big")
@@ -173,10 +187,13 @@ impl DhcpOption {
     pub fn encode(&self, writer: &mut dyn Write) -> io::Result<()> {
         match self {
             Self::SubnetMask(mask) => writer.write_all(&mask.octets()[..]),
+            Self::RouterIp(ip) => writer.write_all(&ip.octets()[..]),
             Self::RequestedIp(addr) => writer.write_all(&addr.octets()[..]),
+            Self::LeaseTime(time) => writer.write_u32::<NetworkEndian>(*time),
             Self::MessageType(t) => writer.write_u8(Into::<u8>::into(*t)),
             Self::ServerId(addr) => writer.write_all(&addr.octets()[..]),
             Self::ClientIdentifier(id) => writer.write_all(id.as_slice()),
+            Self::TftpServerName(name) => writer.write_all(name.as_bytes()),
             Self::Unknown { tag: _, data } => writer.write_all(data.as_slice()),
         }
     }

@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{self, Cursor, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -8,12 +7,10 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use byteorder::{NetworkEndian, WriteBytesExt};
-use futures_util::stream::FuturesUnordered;
 use futures_util::task::{Context, Poll};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 
 use error::{Error, Result};
@@ -204,6 +201,24 @@ enum TftpError {
     NoSuchUser = 7,
 }
 
+impl TryFrom<u16> for TftpError {
+    type Error = u16;
+
+    fn try_from(code: u16) -> ::std::result::Result<Self, Self::Error> {
+        match code {
+            0 => Ok(Self::Other),
+            1 => Ok(Self::NotFound),
+            2 => Ok(Self::AccessDenied),
+            3 => Ok(Self::DiskFull),
+            4 => Ok(Self::IllegalOperation),
+            5 => Ok(Self::UnknownTid),
+            6 => Ok(Self::AlreadyExists),
+            7 => Ok(Self::NoSuchUser),
+            code => Err(code),
+        }
+    }
+}
+
 impl Into<u16> for TftpError {
     fn into(self) -> u16 {
         self as u16
@@ -313,7 +328,34 @@ impl Packet {
                 );
                 Ok(Self::Ack { block })
             }
-            _ => todo!(),
+            5 => {
+                let error_code = u16::from_be_bytes(
+                    TryInto::<[u8; 2]>::try_into(buf.get(2..4).ok_or(Error::InvalidPacket)?)
+                        .unwrap(),
+                );
+                let t = buf
+                    .get(4..)
+                    .ok_or(Error::InvalidPacket)?
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &x)| x == 0)
+                    .map(|(i, _)| i + 4)
+                    .ok_or(Error::InvalidPacket)?;
+
+                let message = if t == 4 {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&buf[4..t]).to_string())
+                };
+
+                let tag = TftpError::try_from(error_code).unwrap_or_else(|_| {
+                    warn!("unknown error code {}", error_code);
+                    TftpError::Other
+                });
+
+                Ok(Self::Error { tag, message })
+            }
+            opcode => Err(Error::UnknownPacketType { opcode }),
         }
     }
 
@@ -376,6 +418,7 @@ impl TransferHandler {
             buffer[2..4].copy_from_slice(&current_block.to_be_bytes()[..]);
 
             let n = self.file.read(&mut buffer[4..]).await?;
+            let is_last = n != self.block_size;
 
             retries = self.retries;
             send_packet = true;
@@ -398,18 +441,20 @@ impl TransferHandler {
                     }
                     result = self.socket.recv(&mut buffer2[..]) => {
                         let n = result?;
-                        // TODO: handle error
-                        let packet = Packet::decode(&buffer2[..n]).unwrap();
-                        if let Packet::Ack { block } = packet {
-                            if block == current_block {
-                                break;
-                            }
+                        if Self::is_ack_packet(&buffer2[..n], current_block) {
+                            break;
                         }
                     }
                 }
             }
 
-            if n != self.block_size {
+            if is_last {
+                self.terminate(current_block + 1).await?;
+                info!("file transfer complete");
+                break;
+            }
+
+            /*if n != self.block_size {
                 // last block transferred, we are done
                 // don't wait for ACK
 
@@ -424,7 +469,7 @@ impl TransferHandler {
                 }
 
                 break;
-            }
+            }*/
 
             current_block += 1;
         }
@@ -434,5 +479,58 @@ impl TransferHandler {
 
     async fn get_file_size(file: &File) -> Option<u64> {
         file.metadata().await.ok().map(|x| x.len())
+    }
+
+    fn is_ack_packet(buffer: &[u8], current_block: u16) -> bool {
+        match Packet::decode(buffer) {
+            Ok(packet) => {
+                if let Packet::Ack { block } = packet {
+                    if block == current_block {
+                        return true;
+                    }
+                }
+            }
+            Err(e) => warn!("packet decode error during file transfer: {}", e),
+        }
+
+        false
+    }
+
+    async fn terminate(&self, block_number: u16) -> io::Result<()> {
+        let packet: &[u8] = &[
+            3u16.to_be_bytes()[0],
+            3u16.to_be_bytes()[1],
+            block_number.to_be_bytes()[0],
+            block_number.to_be_bytes()[1],
+        ];
+        let mut buffer2: [u8; 32] = unsafe { MaybeUninit::uninit().assume_init() };
+
+        let mut retries = self.retries;
+        let mut send_packet = true;
+        loop {
+            if retries == 0 {
+                error!("file transfer timed out after {} retries", self.retries);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "block transfer timed out",
+                ));
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(self.timeout) => {
+                    send_packet = true;
+                    retries -= 1;
+                }
+                _= self.socket.send(&packet[..]), if send_packet => {
+                    send_packet = false;
+                }
+                result = self.socket.recv(&mut buffer2[..]) => {
+                    let n = result?;
+                    if Self::is_ack_packet(&buffer2[..n], block_number) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 }
