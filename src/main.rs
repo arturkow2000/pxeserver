@@ -5,6 +5,7 @@ extern crate log;
 extern crate anyhow;
 
 use std::fmt;
+use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -102,12 +103,20 @@ pub struct Options {
     pub tftp_root: Option<PathBuf>,
 
     #[clap(index = 1)]
-    pub boot_file: PathBuf,
+    pub loader: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let options: Arc<Options> = Arc::new(Options::parse());
+    let mut options: Options = Options::parse();
+    options.tftp_root = if let Some(root) = options.tftp_root.as_deref() {
+        Some(fs::canonicalize(root)?)
+    } else {
+        None
+    };
+    options.loader = fs::canonicalize(options.loader)?;
+
+    let options = Arc::new(options);
 
     if !iputil::belongs(
         options.dhcp_ip_start,

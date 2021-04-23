@@ -57,8 +57,8 @@ pub async fn start(options: &super::Options) {
         ip_range_start,
         ip_range_end,
         server_ip: options.server_ip,
-        tftp_boot_file: crate::tftp::boot_file_path_to_relative(
-            options.boot_file.as_path(),
+        tftp_loader_path: crate::tftp::loader_path_to_relative(
+            options.loader.as_path(),
             options.tftp_root.as_deref(),
         ),
         lease_duration_secs: 3600,
@@ -77,7 +77,7 @@ struct Server {
     ip_range_start: u32,
     ip_range_end: u32,
     server_ip: Ipv4Addr,
-    tftp_boot_file: String,
+    tftp_loader_path: String,
     lease_duration_secs: u32,
 }
 
@@ -283,7 +283,7 @@ impl Server {
                 mac: request_packet.mac,
                 // FIXME
                 server_name: Some("dhcp-pxe-server".to_string()),
-                boot_file_name: Some(self.tftp_boot_file.clone()),
+                boot_file_name: Some(self.tftp_loader_path.clone()),
                 options,
             };
             if let Err(e) = socket
@@ -396,7 +396,7 @@ impl Server {
             mac,
             // TODO
             server_name: Some("dhcp-pxe-server".to_string()),
-            boot_file_name: Some(self.tftp_boot_file.clone()),
+            boot_file_name: Some(self.tftp_loader_path.clone()),
             options,
         };
         if let Err(e) = socket
