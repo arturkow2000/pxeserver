@@ -1,9 +1,13 @@
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::io::{Cursor, Write};
 
 use byteorder::{NetworkEndian, WriteBytesExt};
 
 use super::error::{Error, Result};
+pub use option::TftpOption;
+
+mod option;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -48,6 +52,7 @@ pub enum Packet {
     RwRequest {
         write: bool,
         file: String,
+        options: HashMap<String, option::TftpOption>,
     },
     Ack {
         block: u16,
@@ -137,7 +142,18 @@ impl Packet {
                     return Err(Error::UnsupportedMode(mode));
                 }
 
-                Ok(Self::RwRequest { write, file })
+                let options = &buf[t2 + 1..];
+                let options = if !options.is_empty() {
+                    TftpOption::decode_options(options)?
+                } else {
+                    Default::default()
+                };
+
+                Ok(Self::RwRequest {
+                    write,
+                    file,
+                    options,
+                })
             }
             4 => {
                 let block = u16::from_be_bytes(
@@ -189,5 +205,33 @@ impl Packet {
             Self::Ack { .. } => "ack",
             Self::Error { .. } => "error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{option::TftpOption, Error, Packet};
+
+    #[test]
+    fn test_decode_rrq_wrq() {
+        assert!(
+            matches!(Packet::decode(b"\x00\x01/boot/loader.exe\x00octet\x00").unwrap(),
+                Packet::RwRequest { write: false, file, options }
+                    if file.as_str() == "/boot/loader.exe" && options.is_empty()
+            )
+        );
+
+        assert!(matches!(
+            Packet::decode(b"\x01\xfe"),
+            Err(Error::UnknownPacketType { opcode: 510 })
+        ));
+
+        assert!(
+            matches!(Packet::decode(b"\x00\x02vmlinuz\x00octet\x00blksize\x001432\x00tsize\x00").unwrap(),
+                Packet::RwRequest { write: true, file, options }
+                    if file.as_str() == "vmlinuz" && options.len() == 1
+                        && matches!(options.get("blksize").unwrap(), TftpOption::U32(1432))
+            )
+        );
     }
 }

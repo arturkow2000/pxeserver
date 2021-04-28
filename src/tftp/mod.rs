@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::fs::canonicalize;
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use futures_util::task::{Context, Poll};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, ReadBuf};
@@ -13,13 +15,21 @@ use tokio::net::UdpSocket;
 use tokio_stream::{Stream, StreamExt};
 
 use error::{Error, Result};
-use packet::{Packet, TftpError};
+use packet::{Packet, TftpError, TftpOption};
 
 mod error;
 mod packet;
 mod pathutils;
 
 const MAX_PACKET_SIZE: usize = 1024;
+const TFTP_DEFAULT_BLOCK_SIZE: u32 = 512;
+// at least iPXE fails if block number is greater than 8192
+// TODO: verify maximum block count allowed by RFC
+const MAX_BLOCK_COUNT: u32 = 8192;
+// Maximum size of data block
+// equals to MTU - IP header size - UDP header size - TFTP header size
+// assuming MTU = 1500
+//const MAX_BLOCK_SIZE: u32 = 1408;
 
 pub async fn start(options: &super::Options) {
     let socket = UdpSocket::bind((options.server_ip, 69)).await.unwrap();
@@ -82,31 +92,13 @@ impl Server {
             match r {
                 Ok((client_addr, packet)) => {
                     match packet {
-                        Packet::RwRequest { write, file } => {
-                            match self.establish_connection(client_addr).await {
-                                Ok((tid, s)) => {
-                                    if write {
-                                        // we don't support write
-                                        Self::reply(
-                                            &s,
-                                            &Packet::error(
-                                                TftpError::AccessDenied,
-                                                Some(
-                                                    "write operations are not supported"
-                                                        .to_string(),
-                                                ),
-                                            ),
-                                        )
-                                        .await;
-                                    } else {
-                                        self.handle_read_request(tid, s, file).await;
-                                    }
-                                }
-                                Err(e) => error!(
-                                    "failed to establish connection with {}: {}",
-                                    client_addr, e
-                                ),
-                            }
+                        Packet::RwRequest {
+                            write,
+                            file,
+                            options,
+                        } => {
+                            self.handle_rw_request(client_addr, write, file, options)
+                                .await;
                         }
                         // TODO: warn about ignored packets
                         _ => warn!(
@@ -121,56 +113,149 @@ impl Server {
         }
     }
 
-    async fn open_file_1(&self, root: &Path, file: &str) -> anyhow::Result<File> {
-        let path = pathutils::convert_path(file)
-            .map(|path| pathutils::append_path(root, path.as_path()))??;
+    async fn handle_rw_request(
+        &self,
+        client_addr: SocketAddr,
+        write: bool,
+        file_name: String,
+        options: HashMap<String, TftpOption>,
+    ) {
+        match self.establish_connection(client_addr).await {
+            Ok((tid, socket)) => {
+                if write {
+                    // we don't support write
+                    Self::reply(
+                        &socket,
+                        &Packet::error(
+                            TftpError::AccessDenied,
+                            Some("write operations are not supported".to_string()),
+                        ),
+                    )
+                    .await;
+                } else {
+                    match self.open_file(file_name.as_str(), write).await {
+                        Ok(file) => {
+                            info!("commencing {} transfer (ID {})", file_name, tid);
 
-        trace!("{} => {}", file, path.display());
+                            let can_negotiate = !options.is_empty();
+                            let (block_size, can_negotiate) =
+                                if let Some(opt) = options.get("blksize") {
+                                    let TftpOption::U32(size) = opt;
+                                    (*size, true)
+                                } else {
+                                    (TFTP_DEFAULT_BLOCK_SIZE, false)
+                                };
 
-        Ok(OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(path.as_path())
-            .await?)
-    }
+                            let send_tsize = options.get("tsize").is_some();
 
-    async fn open_file_2(&self, file: &Path) -> anyhow::Result<File> {
-        Ok(OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(file)
-            .await?)
-    }
-
-    async fn handle_read_request(&self, _tid: u16, socket: UdpSocket, file_name: String) {
-        trace!("client requests {}", file_name);
-
-        match if let Some(root) = self.root.as_deref() {
-            self.open_file_1(root, file_name.as_str()).await
-        } else {
-            if file_name.as_str() != "PAYLOAD.BIN" {
-                Self::reply(&socket, &Packet::error(TftpError::NotFound, None)).await;
-                return;
-            } else {
-                self.open_file_2(self.loader.as_path()).await
-            }
-        } {
-            Ok(file) => {
-                TransferHandler {
-                    retries: self.retries,
-                    timeout: self.timeout,
-                    file,
-                    socket,
-                    // TODO: support other block sizes
-                    block_size: 512,
+                            self.handle_read_request(
+                                tid,
+                                socket,
+                                file_name,
+                                file,
+                                block_size,
+                                can_negotiate,
+                                can_negotiate,
+                                send_tsize,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!("transfer ID {} failed to open {}: {}", tid, file_name, e);
+                            Self::reply(&socket, &Packet::error(TftpError::NotFound, None)).await;
+                        }
+                    }
                 }
-                .spawn();
             }
-            Err(e) => {
-                error!("failed to open {}: {}", file_name, e);
-                Self::reply(&socket, &Packet::error(TftpError::NotFound, None)).await;
-            }
+            Err(e) => error!("failed to establish connection with {}: {}", client_addr, e),
         }
+    }
+
+    async fn open_file(&self, file: &str, write: bool) -> Result<File> {
+        // FIXME: workaround to prevent value from dropping
+        let mut _t = None;
+
+        let path = if let Some(root) = self.root.as_deref() {
+            _t = Some(
+                pathutils::convert_path(file)
+                    .map(|path| pathutils::append_path(root, path.as_path()))??,
+            );
+            _t.as_deref().unwrap()
+        } else {
+            if file == "PAYLOAD.BIN" {
+                self.loader.as_path()
+            } else {
+                return Err(Error::from(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "file not found",
+                )));
+            }
+        };
+
+        Ok(OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open(path)
+            .await?)
+    }
+
+    async fn handle_read_request(
+        &self,
+        tid: u16,
+        socket: UdpSocket,
+        file_name: String,
+        file: File,
+        block_size: u32,
+        can_negotiate: bool,
+        can_negotiate_block_size: bool,
+        send_tsize: bool,
+    ) {
+        let file_len = file.metadata().await.ok().map(|x| x.len());
+
+        if can_negotiate {
+            self.negotiate(
+                &socket,
+                if can_negotiate_block_size {
+                    Some(block_size)
+                } else {
+                    None
+                },
+                if send_tsize { file_len } else { None },
+            )
+            .await;
+        }
+
+        TransferHandler {
+            retries: self.retries,
+            timeout: self.timeout,
+            file_name,
+            file,
+            socket,
+            block_size: block_size as usize,
+            tid,
+        }
+        .spawn();
+    }
+
+    async fn negotiate(&self, socket: &UdpSocket, block_size: Option<u32>, tsize: Option<u64>) {
+        let mut encoded: Vec<u8> = Vec::new();
+        encoded.extend_from_slice(&6u16.to_be_bytes()[..]); // opcode
+        if let Some(block_size) = block_size {
+            encoded.extend_from_slice(b"blksize\x00");
+            encoded.extend_from_slice(block_size.to_string().as_bytes());
+            encoded.push(0);
+        }
+        if let Some(tsize) = tsize {
+            encoded.extend_from_slice(b"tsize\x00");
+            encoded.extend_from_slice(tsize.to_string().as_bytes());
+            encoded.push(0);
+        }
+
+        if encoded.len() == 2 {
+            encoded.push(0);
+        }
+
+        socket.send(encoded.as_slice()).await.unwrap();
     }
 
     async fn reply(s: &UdpSocket, packet: &Packet) {
@@ -217,80 +302,68 @@ impl<'a> Stream for PacketStream<'a> {
 struct TransferHandler {
     retries: u32,
     timeout: Duration,
+    file_name: String,
     file: File,
     socket: UdpSocket,
     block_size: usize,
+    tid: u16,
 }
 
 impl TransferHandler {
     fn spawn(mut self) {
         tokio::spawn(async move {
+            let start = Instant::now();
             if let Err(e) = self.transfer_file().await {
-                error!("file transfer failed: {}", e);
+                error!(
+                    "transfer ID {} of {} failed: {}",
+                    self.tid, self.file_name, e
+                );
+            } else {
+                info!(
+                    "transfer ID {} of {} done after {} s",
+                    self.tid,
+                    self.file_name,
+                    Instant::now().duration_since(start).as_secs()
+                );
             }
         });
     }
 
-    async fn transfer_file(&mut self) -> io::Result<()> {
-        // buffer for data packet, size = data block size + header (opcode + block number)
-        let mut buffer = Vec::with_capacity(self.block_size + 4);
-        unsafe { buffer.set_len(self.block_size + 4) };
+    async fn transfer_file(&mut self) -> anyhow::Result<()> {
+        //let mut header: [u8; 4] = [0, 6, 0, 0];
 
-        // buffer for ack packet
-        let mut buffer2: [u8; 32] = unsafe { MaybeUninit::uninit().assume_init() };
+        // buffer for outgoing data packet, size = data block size + header (opcode + block number)
+        let mut buffer_out: Vec<u8> = Vec::new();
+        buffer_out.resize(self.block_size + 4, 0);
+
+        // buffer for incoming packet, used by send_data
+        // declared here to prevent reinitializing array on every call to send_data
+        //
+        // seems like there is no simple way to read from socket into uninitialized array
+        // MaybeUninit::uninit() is not an option as recv() takes reference to u8 not MaybeUninit<u8>
+        // converting MaybeUninit<T> into T prior to initialization is instant UB.
+        // see
+        // https://doc.rust-lang.org/std/mem/union.MaybeUninit.html
+        // https://www.ralfj.de/blog/2019/07/14/uninit.html
+        let mut buffer_in: [u8; 32] = [0; 32];
 
         let mut current_block: u16 = 1;
-        let mut send_packet: bool;
-        let mut retries: u32;
-
-        buffer[..2].copy_from_slice(&3u16.to_be_bytes()[..]);
-
-        if let Some(file_size) = Self::get_file_size(&self.file).await {
-            debug!(
-                "transferring file size={} block_size={} num_blocks={}",
-                file_size,
-                self.block_size,
-                file_size / self.block_size as u64
-            );
-        }
 
         loop {
-            buffer[2..4].copy_from_slice(&current_block.to_be_bytes()[..]);
+            buffer_out[..2].copy_from_slice(&3u16.to_be_bytes()[..]);
+            buffer_out[2..4].copy_from_slice(&current_block.to_be_bytes()[..]);
 
-            let n = self.file.read(&mut buffer[4..]).await?;
-            let is_last = n != self.block_size;
+            let n = self
+                .file
+                .read(&mut buffer_out[4..])
+                .await
+                .context("failed to read from file")?;
 
-            retries = self.retries;
-            send_packet = true;
-            loop {
-                if retries == 0 {
-                    error!("file transfer timed out after {} retries", self.retries);
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "block transfer timed out",
-                    ));
-                }
+            self.send_data(current_block, &buffer_out[..n + 4], &mut buffer_in[..])
+                .await?;
 
-                tokio::select! {
-                    _ = tokio::time::sleep(self.timeout) => {
-                        send_packet = true;
-                        retries -= 1;
-                    }
-                    _ = self.socket.send(&buffer[..]), if send_packet => {
-                        send_packet = false;
-                    }
-                    result = self.socket.recv(&mut buffer2[..]) => {
-                        let n = result?;
-                        if Self::is_ack_packet(&buffer2[..n], current_block) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if is_last {
-                self.terminate(current_block + 1).await?;
-                info!("file transfer complete");
+            if n != self.block_size {
+                // last block sent
                 break;
             }
 
@@ -300,8 +373,33 @@ impl TransferHandler {
         Ok(())
     }
 
-    async fn get_file_size(file: &File) -> Option<u64> {
-        file.metadata().await.ok().map(|x| x.len())
+    async fn send_data(
+        &self,
+        current_block: u16,
+        data: &[u8],
+        in_buffer: &mut [u8],
+    ) -> anyhow::Result<()> {
+        let mut left_retries = self.retries;
+
+        let mut interval = tokio::time::interval(self.timeout);
+        while left_retries > 0 {
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.socket.send(data).await
+                        .context("failed to write to socket")?;
+
+                    left_retries -= 1;
+                }
+                result = self.socket.recv(in_buffer) => {
+                    let total_read = result?;
+                    if Self::is_ack_packet(&in_buffer[..total_read], current_block) {
+                        return Ok(());
+                    }
+                }
+            };
+        }
+
+        bail!("timed out");
     }
 
     fn is_ack_packet(buffer: &[u8], current_block: u16) -> bool {
@@ -317,43 +415,5 @@ impl TransferHandler {
         }
 
         false
-    }
-
-    async fn terminate(&self, block_number: u16) -> io::Result<()> {
-        let packet: &[u8] = &[
-            3u16.to_be_bytes()[0],
-            3u16.to_be_bytes()[1],
-            block_number.to_be_bytes()[0],
-            block_number.to_be_bytes()[1],
-        ];
-        let mut buffer2: [u8; 32] = unsafe { MaybeUninit::uninit().assume_init() };
-
-        let mut retries = self.retries;
-        let mut send_packet = true;
-        loop {
-            if retries == 0 {
-                error!("file transfer timed out after {} retries", self.retries);
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "block transfer timed out",
-                ));
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(self.timeout) => {
-                    send_packet = true;
-                    retries -= 1;
-                }
-                _= self.socket.send(&packet[..]), if send_packet => {
-                    send_packet = false;
-                }
-                result = self.socket.recv(&mut buffer2[..]) => {
-                    let n = result?;
-                    if Self::is_ack_packet(&buffer2[..n], block_number) {
-                        return Ok(());
-                    }
-                }
-            }
-        }
     }
 }

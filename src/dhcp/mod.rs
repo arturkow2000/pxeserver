@@ -10,6 +10,7 @@ use tokio::net::UdpSocket;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::dhcp::id::Mac;
+use crate::Ipv4AddrAndMask;
 pub use error::{Error, Result};
 use id::ClientId;
 use packet::{
@@ -26,21 +27,27 @@ mod packet;
 
 const MAX_PACKET_SIZE: usize = 1024;
 
-pub async fn start(options: &super::Options) {
-    let socket = UdpSocket::bind((options.server_ip, 67)).await.unwrap();
+pub async fn start(
+    options: &super::Options,
+    server_ip: Ipv4Addr,
+    dhcp_ip_start: Ipv4Addr,
+    dhcp_ip_end: Ipv4Addr,
+    dhcp_subnet: Ipv4AddrAndMask,
+) {
+    let socket = UdpSocket::bind((server_ip, 67)).await.unwrap();
     socket.set_broadcast(true).unwrap();
 
-    let mask = options.dhcp_subnet.mask_raw();
+    let mask = dhcp_subnet.mask_raw();
 
-    let ip_range_start = Into::<u32>::into(options.dhcp_ip_start) & !mask;
-    let ip_range_end = Into::<u32>::into(options.dhcp_ip_end) & !mask;
+    let ip_range_start = Into::<u32>::into(dhcp_ip_start) & !mask;
+    let ip_range_end = Into::<u32>::into(dhcp_ip_end) & !mask;
     let ip_range_size = ip_range_end - ip_range_start + 1;
 
-    let broadcast_ip = Ipv4Addr::from(Into::<u32>::into(options.dhcp_subnet.address) | !mask);
+    let broadcast_ip = Ipv4Addr::from(Into::<u32>::into(dhcp_subnet.address()) | !mask);
 
     debug!("server starting");
-    debug!("server ip: {}", options.server_ip);
-    debug!("server subnet: {}", options.dhcp_subnet);
+    debug!("server ip: {}", server_ip);
+    debug!("server subnet: {}", dhcp_subnet);
     debug!(
         "IP range: {} - {} ({} IP addresses available)",
         ip_range_start, ip_range_end, ip_range_size
@@ -50,13 +57,13 @@ pub async fn start(options: &super::Options) {
     Server {
         leases: BTreeMap::new(),
         pending: BTreeMap::new(),
-        subnet_mask: options.dhcp_subnet.mask(),
-        subnet_mask_width: options.dhcp_subnet.mask_width,
-        subnet: options.dhcp_subnet.address(),
+        subnet_mask: dhcp_subnet.mask(),
+        subnet_mask_width: dhcp_subnet.mask_width(),
+        subnet: dhcp_subnet.address(),
         broadcast_ip,
         ip_range_start,
         ip_range_end,
-        server_ip: options.server_ip,
+        server_ip: server_ip,
         tftp_loader_path: crate::tftp::loader_path_to_relative(
             options.loader.as_path(),
             options.tftp_root.as_deref(),
