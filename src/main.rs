@@ -17,6 +17,8 @@ use iputil::Ipv4AddrAndMask;
 use tokio::task::JoinHandle;
 
 mod dhcp;
+#[cfg(feature = "http")]
+mod http;
 mod iputil;
 mod tftp;
 
@@ -45,11 +47,18 @@ pub struct Options {
     #[clap(long, group = "dhcp")]
     pub dhcp_subnet: Option<Ipv4AddrAndMask>,
 
+    #[clap(long)]
+    pub mtu: Option<u16>,
+
     #[clap(short = 'r', long)]
     pub tftp_root: Option<PathBuf>,
 
     #[clap(index = 1)]
     pub loader: PathBuf,
+
+    #[cfg(feature = "http")]
+    #[clap(long, default_value = "8080")]
+    pub http_port: u16,
 }
 
 #[tokio::main]
@@ -75,6 +84,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     fut_list.push(start_tftp_server(Arc::clone(&options)).context("failed to spawn TFTP server")?);
+
+    #[cfg(feature = "http")]
+    {
+        fut_list
+            .push(start_http_server(Arc::clone(&options)).context("failed to spawn HTTP server")?);
+    }
 
     while let Some(x) = fut_list.next().await {
         if let Err(e) = x {
@@ -114,4 +129,9 @@ fn start_tftp_server(options: Arc<Options>) -> anyhow::Result<JoinHandle<()>> {
     Ok(tokio::spawn(async move {
         tftp::start(&*options).await;
     }))
+}
+
+#[cfg(feature = "http")]
+fn start_http_server(options: Arc<Options>) -> anyhow::Result<JoinHandle<()>> {
+    Ok(tokio::spawn(async move { http::start(&*options).await }))
 }

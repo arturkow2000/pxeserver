@@ -19,17 +19,12 @@ use packet::{Packet, TftpError, TftpOption};
 
 mod error;
 mod packet;
-mod pathutils;
+// shared with HTTP server
+// TODO: move to common
+pub mod pathutils;
 
 const MAX_PACKET_SIZE: usize = 1024;
 const TFTP_DEFAULT_BLOCK_SIZE: u32 = 512;
-// at least iPXE fails if block number is greater than 8192
-// TODO: verify maximum block count allowed by RFC
-const MAX_BLOCK_COUNT: u32 = 8192;
-// Maximum size of data block
-// equals to MTU - IP header size - UDP header size - TFTP header size
-// assuming MTU = 1500
-//const MAX_BLOCK_SIZE: u32 = 1408;
 
 pub async fn start(options: &super::Options) {
     let socket = UdpSocket::bind((options.server_ip, 69)).await.unwrap();
@@ -79,6 +74,7 @@ struct Server {
     root: Option<PathBuf>,
     loader: PathBuf,
     // path relative to root in URL format
+    #[allow(dead_code)]
     loader_relative: String,
     retries: u32,
     timeout: Duration,
@@ -138,7 +134,7 @@ impl Server {
                             info!("commencing {} transfer (ID {})", file_name, tid);
 
                             let can_negotiate = !options.is_empty();
-                            let (block_size, can_negotiate) =
+                            let (block_size, can_negotiate_block_size) =
                                 if let Some(opt) = options.get("blksize") {
                                     let TftpOption::U32(size) = opt;
                                     (*size, true)
@@ -155,7 +151,7 @@ impl Server {
                                 file,
                                 block_size,
                                 can_negotiate,
-                                can_negotiate,
+                                can_negotiate_block_size,
                                 send_tsize,
                             )
                             .await;

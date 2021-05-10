@@ -16,7 +16,7 @@ use id::ClientId;
 use packet::{
     options::{
         DhcpOption, MessageType, DHCP_CLIENT_IDENTIFIER, DHCP_LEASE_TIME, DHCP_MESSAGE_TYPE,
-        DHCP_REQUESTED_IP, DHCP_SERVER_ID, DHCP_SUBNET_MASK, DHCP_TFTP_SERVER_NAME,
+        DHCP_MTU, DHCP_REQUESTED_IP, DHCP_SERVER_ID, DHCP_SUBNET_MASK, DHCP_TFTP_SERVER_NAME,
     },
     BootpMessageType, Packet,
 };
@@ -69,6 +69,7 @@ pub async fn start(
             options.tftp_root.as_deref(),
         ),
         lease_duration_secs: 3600,
+        mtu: options.mtu,
     }
     .start(socket)
     .await
@@ -86,12 +87,14 @@ struct Server {
     server_ip: Ipv4Addr,
     tftp_loader_path: String,
     lease_duration_secs: u32,
+    mtu: Option<u16>,
 }
 
 impl Server {
     async fn start(mut self, socket: UdpSocket) {
         let mut stream = PacketStream { socket: &socket };
         while let Some(packet) = stream.next().await {
+            error!("processing packet");
             match packet {
                 Ok(packet) if packet.bootp_message_type == BootpMessageType::Request => {
                     if let Err(e) = self.process_packet(packet, &socket).await {
@@ -115,7 +118,7 @@ impl Server {
                 .get(&DHCP_CLIENT_IDENTIFIER)
                 .cloned()
                 .map_or(Vec::new(), |x| {
-                    if let DhcpOption::ClientIdentifier(x) = x {
+                    if let DhcpOption::ByteArray(x) = x {
                         x
                     } else {
                         Vec::new()
@@ -134,10 +137,10 @@ impl Server {
                 Ok(())
             }
             Some(DhcpOption::MessageType(_t @ MessageType::Request)) => {
-                if let Some(DhcpOption::RequestedIp(requested_ip)) =
+                if let Some(DhcpOption::Ipv4Addr(requested_ip)) =
                     packet.options.get(&DHCP_REQUESTED_IP)
                 {
-                    if let Some(DhcpOption::ServerId(server_ip)) =
+                    if let Some(DhcpOption::Ipv4Addr(server_ip)) =
                         packet.options.get(&DHCP_SERVER_ID)
                     {
                         if *server_ip == self.server_ip {
@@ -262,18 +265,18 @@ impl Server {
                 DHCP_MESSAGE_TYPE,
                 DhcpOption::MessageType(MessageType::Offer),
             );
-            options.insert(DHCP_SUBNET_MASK, DhcpOption::SubnetMask(self.subnet_mask));
-            options.insert(DHCP_SERVER_ID, DhcpOption::ServerId(self.server_ip));
+            options.insert(DHCP_SUBNET_MASK, DhcpOption::Ipv4Addr(self.subnet_mask));
+            options.insert(DHCP_SERVER_ID, DhcpOption::Ipv4Addr(self.server_ip));
             //options.insert(DHCP_ROUTER_IP, DhcpOption::RouterIp(self.server_ip));
-            options.insert(
-                DHCP_LEASE_TIME,
-                DhcpOption::LeaseTime(self.lease_duration_secs),
-            );
+            options.insert(DHCP_LEASE_TIME, DhcpOption::U32(self.lease_duration_secs));
             // some PXE clients need this
             options.insert(
                 DHCP_TFTP_SERVER_NAME,
-                DhcpOption::TftpServerName(self.server_ip.to_string()),
+                DhcpOption::String(self.server_ip.to_string()),
             );
+            if let Some(mtu) = self.mtu {
+                options.insert(DHCP_MTU, DhcpOption::U16(mtu));
+            }
 
             let offer_packet = Packet {
                 bootp_message_type: BootpMessageType::Reply,
@@ -328,7 +331,7 @@ impl Server {
             } else {
                 false
             }
-        } else if let Some((c, _)) = self.pending.get(&ip) {
+        } else if let Some((_c, _)) = self.pending.get(&ip) {
             // FIXME: pending requests never expire
             false
         } else {
@@ -376,17 +379,17 @@ impl Server {
     ) {
         let mut options = BTreeMap::new();
         options.insert(DHCP_MESSAGE_TYPE, DhcpOption::MessageType(MessageType::Ack));
-        options.insert(DHCP_SUBNET_MASK, DhcpOption::SubnetMask(self.subnet_mask));
-        options.insert(DHCP_SERVER_ID, DhcpOption::ServerId(self.server_ip));
-        options.insert(
-            DHCP_LEASE_TIME,
-            DhcpOption::LeaseTime(self.lease_duration_secs),
-        );
+        options.insert(DHCP_SUBNET_MASK, DhcpOption::Ipv4Addr(self.subnet_mask));
+        options.insert(DHCP_SERVER_ID, DhcpOption::Ipv4Addr(self.server_ip));
+        options.insert(DHCP_LEASE_TIME, DhcpOption::U32(self.lease_duration_secs));
         // some PXE clients need this
         options.insert(
             DHCP_TFTP_SERVER_NAME,
-            DhcpOption::TftpServerName(self.server_ip.to_string()),
+            DhcpOption::String(self.server_ip.to_string()),
         );
+        if let Some(mtu) = self.mtu {
+            options.insert(DHCP_MTU, DhcpOption::U16(mtu));
+        }
 
         let packet = Packet {
             bootp_message_type: BootpMessageType::Reply,
@@ -423,8 +426,8 @@ impl<'a> Stream for PacketStream<'a> {
     type Item = Result<Packet>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut buf: [u8; MAX_PACKET_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-        let mut rb = ReadBuf::new(&mut buf);
+        let mut buf: [MaybeUninit<u8>; MAX_PACKET_SIZE] = [MaybeUninit::uninit(); MAX_PACKET_SIZE];
+        let mut rb = ReadBuf::uninit(&mut buf);
 
         match self.socket.poll_recv(cx, &mut rb) {
             Poll::Pending => Poll::Pending,

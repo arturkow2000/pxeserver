@@ -47,8 +47,6 @@ impl Packet {
             cursor.write_all(&[99, 130, 83, 99]).unwrap();
 
             for (&tag, option) in self.options.iter() {
-                assert_eq!(tag, option.tag());
-
                 cursor.write_u8(tag).unwrap();
                 cursor.write_u8(option.len()).unwrap();
                 option.encode(&mut cursor).unwrap();
