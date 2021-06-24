@@ -29,13 +29,15 @@ const MAX_PACKET_SIZE: usize = 1024;
 
 pub async fn start(
     options: &super::Options,
-    server_ip: Ipv4Addr,
     dhcp_ip_start: Ipv4Addr,
     dhcp_ip_end: Ipv4Addr,
     dhcp_subnet: Ipv4AddrAndMask,
 ) {
-    let socket = UdpSocket::bind((server_ip, 67)).await.unwrap();
+    let socket = UdpSocket::bind((Ipv4Addr::BROADCAST, 67)).await.unwrap();
     socket.set_broadcast(true).unwrap();
+    crate::util::udp_enable_pktinfo(&socket).unwrap();
+
+    let server_ip = Ipv4Addr::BROADCAST;
 
     let mask = dhcp_subnet.mask_raw();
 
@@ -46,7 +48,6 @@ pub async fn start(
     let broadcast_ip = Ipv4Addr::from(Into::<u32>::into(dhcp_subnet.address()) | !mask);
 
     debug!("server starting");
-    debug!("server ip: {}", server_ip);
     debug!("server subnet: {}", dhcp_subnet);
     debug!(
         "IP range: {} - {} ({} IP addresses available)",
@@ -92,19 +93,34 @@ struct Server {
 
 impl Server {
     async fn start(mut self, socket: UdpSocket) {
-        let mut stream = PacketStream { socket: &socket };
-        while let Some(packet) = stream.next().await {
-            error!("processing packet");
-            match packet {
-                Ok(packet) if packet.bootp_message_type == BootpMessageType::Request => {
-                    if let Err(e) = self.process_packet(packet, &socket).await {
-                        error!("{}", e);
+        // TODO: do not zero buffer, buffer should be initialized during read
+        let mut buffer = Vec::new();
+        buffer.resize(MAX_PACKET_SIZE, 0);
+
+        loop {
+            match crate::util::udp_read(&socket, buffer.as_mut()).await {
+                Ok((len, ifindex)) => {
+                    if let Some(ifindex) = ifindex {
+                        match Packet::parse(&buffer[..len]) {
+                            Ok(packet) => {
+                                if let Err(e) = self.process_packet(packet, &socket).await {
+                                    error!("{}", e);
+                                }
+                            }
+                            Err(e) => warn!("{}", e),
+                        }
+                    } else {
+                        warn!("dropping packet coming from unknown source");
                     }
                 }
-                Ok(packet) => error!("dropped {} packet", packet.bootp_message_type),
-                Err(e) => error!("{}", e),
-            }
+                Err(e) => {
+                    error!("{}", e);
+                    break;
+                }
+            };
         }
+
+        warn!("DHCP server terminating");
     }
 
     async fn process_packet(&mut self, packet: Packet, socket: &UdpSocket) -> anyhow::Result<()> {
@@ -418,7 +434,7 @@ impl Server {
     }
 }
 
-struct PacketStream<'a> {
+/*struct PacketStream<'a> {
     socket: &'a UdpSocket,
 }
 
@@ -437,4 +453,4 @@ impl<'a> Stream for PacketStream<'a> {
             Poll::Ready(Err(x)) => Poll::Ready(Some(Err(Error::from(x)))),
         }
     }
-}
+}*/
