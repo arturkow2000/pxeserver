@@ -27,7 +27,8 @@ const MAX_PACKET_SIZE: usize = 1024;
 const TFTP_DEFAULT_BLOCK_SIZE: u32 = 512;
 
 pub async fn start(options: &super::Options) {
-    let socket = UdpSocket::bind((options.server_ip, 69)).await.unwrap();
+    // FIXME: allow traffic only from selected interfaces
+    let socket = UdpSocket::bind((Ipv4Addr::BROADCAST, 69)).await.unwrap();
     socket.set_broadcast(true).unwrap();
 
     debug!("server starting");
@@ -44,7 +45,6 @@ pub async fn start(options: &super::Options) {
     debug!("loader: {} ({})", loader.display(), loader_relative);
 
     Server {
-        server_ip: options.server_ip,
         root,
         loader,
         loader_relative,
@@ -70,7 +70,6 @@ pub fn loader_path_to_relative(loader: &Path, root: Option<&Path>) -> String {
 }
 
 struct Server {
-    server_ip: Ipv4Addr,
     root: Option<PathBuf>,
     loader: PathBuf,
     // path relative to root in URL format
@@ -262,7 +261,8 @@ impl Server {
 
     async fn establish_connection(&self, client_addr: SocketAddr) -> io::Result<(u16, UdpSocket)> {
         let tid = Self::select_tid();
-        let socket = UdpSocket::bind((self.server_ip, tid)).await?;
+        // FIXME: bind to IP set on interface request came from, instead of broadcast
+        let socket = UdpSocket::bind((Ipv4Addr::BROADCAST, tid)).await?;
         socket.connect(client_addr).await?;
 
         Ok((tid, socket))

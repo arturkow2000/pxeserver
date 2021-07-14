@@ -26,8 +26,9 @@ pub async fn start(options: &super::Options) {
             future::ok::<_, hyper::Error>(service)
         });
 
+        // FIXME: allow traffic only from selected interfaces
         if let Err(e) =
-            hyper::Server::bind(&SocketAddr::from((options.server_ip, options.http_port)))
+            hyper::Server::bind(&SocketAddr::from((Ipv4Addr::BROADCAST, options.http_port)))
                 .serve(make_service)
                 .await
         {

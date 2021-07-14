@@ -4,6 +4,9 @@ extern crate log;
 #[macro_use]
 extern crate anyhow;
 
+#[macro_use]
+extern crate nom;
+
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -21,6 +24,7 @@ mod dhcp;
 mod http;
 mod iputil;
 mod tftp;
+mod util;
 
 #[derive(Clap)]
 #[clap(group =
@@ -36,7 +40,7 @@ mod tftp;
 )]
 pub struct Options {
     #[clap(short, long)]
-    pub server_ip: Ipv4Addr,
+    pub interface: String,
 
     #[clap(long, about = "IP range start", group = "dhcp")]
     pub dhcp_ip_start: Option<Ipv4Addr>,
@@ -114,14 +118,7 @@ fn start_dhcp_server(options: Arc<Options>) -> anyhow::Result<JoinHandle<()>> {
     }
 
     Ok(tokio::spawn(async move {
-        dhcp::start(
-            &*options,
-            options.server_ip,
-            dhcp_ip_start,
-            dhcp_ip_end,
-            dhcp_subnet,
-        )
-        .await
+        dhcp::start(&*options, dhcp_ip_start, dhcp_ip_end, dhcp_subnet).await
     }))
 }
 
